@@ -1,2 +1,2 @@
 # pz1
-Projekt na przedmiot Projekt Zespołowy
+Projekt na przedmiot Projekt Zespołowy.
