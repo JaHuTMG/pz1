@@ -134,7 +134,7 @@ while cap.isOpened():
     if frame_objects:
         match_data.append({"frame_id": frame_id, "objects": frame_objects})
 
-    cv2.imshow("Szymon AI - Stabilne ID", frame)
+    cv2.imshow("Detekcja", frame)
     if cv2.waitKey(1) & 0xFF == ord("q"): break
 
 cap.release()
