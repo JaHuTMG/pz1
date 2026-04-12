@@ -3,11 +3,13 @@ import numpy as np
 import json
 from ultralytics import YOLO
 from sklearn.cluster import KMeans
+import pandas as pd
+import supervision as sv
 
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
-        if isinstance(obj, np.integer): return int(obj)
-        if isinstance(obj, np.floating): return float(obj)
+        if isinstance(obj, (np.integer, np.int64)): return int(obj)
+        if isinstance(obj, (np.floating, np.float64)): return float(obj)
         if isinstance(obj, np.ndarray): return obj.tolist()
         return super(NumpyEncoder, self).default(obj)
 
@@ -45,103 +47,122 @@ def get_dominant_color(crop):
 
 
 model = YOLO('yolo11s.pt')
-cap = cv2.VideoCapture("test.mp4")
+#model.to('cuda')
+video_path = "test.mp4"
 
-id_mapping = {}  # Nowe ID -> Stare ID
-last_positions = {}  # Ostatnie X,Y każdego ID
-last_seen_frame = {}  # Numer klatki ostatniego widzenia
-last_colors = {}  # Zapamiętany kolor koszulki każdego ID
+tracker = sv.ByteTrack(track_activation_threshold=0.1, lost_track_buffer=60)
+generator = sv.get_video_frames_generator(video_path)
 
+last_colors = {}
 match_data = []
-frame_id = 0
+ball_positions = []
+ALPHA = 0.2
 
 
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success: break
-    frame_id += 1
+for frame_id, frame in enumerate(generator, start=1):
     frame_objects = []
+    current_ball_pos = [None, None]
 
     h, w = frame.shape[:2]
     scale_ratio = 1280 / w if w > 1280 else 1.0
-    if w > 1280:
-        frame = cv2.resize(frame, (1280, int(h * scale_ratio)))
 
-    results = model.track(frame, persist=True, conf=0.1, tracker="tracker_config.yaml")
+    if scale_ratio != 1.0:
+        proc_frame = cv2.resize(frame, (1280, int(h * scale_ratio)))
+    else:
+        proc_frame = frame.copy()
 
-    if results[0].boxes.id is not None:
-        boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
-        ids = results[0].boxes.id.cpu().numpy().astype(int)
-        classes = results[0].boxes.cls.cpu().numpy().astype(int)
+    results = model(proc_frame, imgsz=1280, conf=0.05, verbose=False)[0]
+    detections = sv.Detections.from_ultralytics(results)
 
-        for box, track_id, cls in zip(boxes, ids, classes):
-            if cls != 0: continue  # Skupienie sie tylko na zawodnikach
+    players_det = detections[detections.class_id == 0]
+    tracked_players = tracker.update_with_detections(players_det)
 
-            x1, y1, x2, y2 = box
-            original_track_id = int(track_id)
-            curr_pos = np.array([int((x1 + x2) / 2), y2])
+    for box, track_id in zip(tracked_players.xyxy, tracked_players.tracker_id):
+        x1, y1, x2, y2 = box.astype(int)
 
-            # Pobranie koloru
-            person_crop = frame[y1:y2, x1:x2]
-            current_color = get_dominant_color(person_crop)
+        feet_x = int(((x1 + x2) / 2) / scale_ratio)
+        feet_y = int(y2 / scale_ratio)
 
-            # Odzyskanie zgubionego ID
-            if original_track_id in id_mapping:
-                track_id = id_mapping[original_track_id]
+        person_crop = proc_frame[y1:y2, x1:x2]
+        current_color = get_dominant_color(person_crop)
+
+        if sum(current_color) > 30:
+            if track_id in last_colors:
+                smoothed_color = (1 - ALPHA) * np.array(last_colors[track_id]) + ALPHA * current_color
+                last_colors[track_id] = smoothed_color.astype(int).tolist()
             else:
-                best_match = None
-                min_dist = 120  # Dystans szukania zgubionego ID
+                last_colors[track_id] = current_color.tolist()
 
-                for old_id, old_pos in last_positions.items():
-                    # Ignorujemy graczy aktualnie widocznych
-                    if last_seen_frame.get(old_id, 0) == frame_id: continue
-                    # Ignorujemy tych, których nie ma > 2 sekundy (60 klatek)
-                    if frame_id - last_seen_frame.get(old_id, 0) > 60: continue
+        color = last_colors.get(track_id, [255, 255, 255])
+        b, g, r = color
 
-                    # Filtr koloru
-                    color_diff = np.linalg.norm(current_color - last_colors.get(old_id, np.array([0, 0, 0])))
+        cv2.ellipse(proc_frame, center=(int((x1 + x2) / 2), y2), axes=(int((x2 - x1) / 2), int((y2 - y1) * 0.1)),
+                    angle=0, startAngle=0, endAngle=360, color=(int(b), int(g), int(r)), thickness=2)
+        cv2.putText(proc_frame, f"ID:{track_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (int(b), int(g), int(r)), 2)
 
-                    if color_diff > 45:
-                        continue
+        frame_objects.append({
+            "id": int(track_id),
+            "type": "person",
+            "point": [feet_x, feet_y],
+            "color": color
+        })
 
-                    dist = np.linalg.norm(curr_pos - old_pos)
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_match = old_id
+    balls_det = detections[detections.class_id == 32]
 
-                if best_match is not None:
-                    id_mapping[original_track_id] = best_match
-                    track_id = best_match
+    if len(balls_det) > 0:
+        best_ball_idx = np.argmax(balls_det.confidence)
+        bx1, by1, bx2, by2 = balls_det.xyxy[best_ball_idx].astype(int)
 
-            # Aktualizacja pamieci
-            last_positions[track_id] = curr_pos
-            last_seen_frame[track_id] = frame_id
-            if sum(current_color) > 30:
-                last_colors[track_id] = current_color
+        ball_x = int((bx1 + bx2) / 2)
+        ball_y = int((by1 + by2) / 2)
 
-            # Rysowanie i zapis
-            b, g, r = last_colors.get(track_id, current_color)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (int(b), int(g), int(r)), 2)
-            cv2.putText(frame, f"ID:{track_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (int(b), int(g), int(r)),
-                        2)
+        real_ball_x = int(ball_x / scale_ratio)
+        real_ball_y = int(ball_y / scale_ratio)
+        current_ball_pos = [real_ball_x, real_ball_y]
 
-            frame_objects.append({
-                "id": int(track_id),
-                "type": "person",
-                "point": [int(curr_pos[0] / scale_ratio), int(curr_pos[1] / scale_ratio)]
-            })
+        cv2.circle(proc_frame, (ball_x, ball_y), 6, (0, 0, 255), -1)
+        cv2.circle(proc_frame, (ball_x, ball_y), 8, (255, 255, 255), 2)
+        cv2.putText(proc_frame, "Pilka", (ball_x - 15, ball_y - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+    ball_positions.append({
+        "frame_id": frame_id,
+        "ball_x": current_ball_pos[0],
+        "ball_y": current_ball_pos[1]
+    })
 
     if frame_objects:
         match_data.append({"frame_id": frame_id, "objects": frame_objects})
 
-    cv2.imshow("Detekcja", frame)
-    if cv2.waitKey(1) & 0xFF == ord("q"): break
+    cv2.imshow("Detekcja", proc_frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
 
-cap.release()
+
 cv2.destroyAllWindows()
 
-# EKSPORT DO JSON PO ZAKOŃCZENIU
-# print("\n[INFO] Zapisywanie trajektorii do pliku match_data.json...")
+
+df_ball = pd.DataFrame(ball_positions)
+
+df_ball['ball_x'] = df_ball['ball_x'].interpolate(method='quadratic').bfill().ffill()
+df_ball['ball_y'] = df_ball['ball_y'].interpolate(method='quadratic').bfill().ffill()
+
+ball_dict = df_ball.set_index('frame_id').to_dict('index')
+
+for frame_data in match_data:
+    fid = frame_data["frame_id"]
+    if fid in ball_dict:
+        bx = ball_dict[fid]['ball_x']
+        by = ball_dict[fid]['ball_y']
+
+        if pd.notna(bx) and pd.notna(by):
+            frame_data["objects"].append({
+                "id": 999,
+                "type": "ball",
+                "point": [int(bx), int(by)]
+            })
+
+# print("[INFO] Zapisywanie danych do pliku match_data.json...")
 # with open('match_data.json', 'w') as f:
 #     json.dump(match_data, f, indent=4, cls=NumpyEncoder)
-# print("[INFO] Gotowe")
+# print("[INFO] Gotowe! Piłka dodana do boiska.")
