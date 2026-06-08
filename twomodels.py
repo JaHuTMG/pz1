@@ -90,10 +90,10 @@ def get_dominant_color(crop):
 
 model = YOLO('yolo11s.pt')
 model.to('cuda')
-pitch_model = YOLO('best.pt')
+pitch_model = YOLO('runs/pose/pitch_keypoints-7/weights/best.pt')
 pitch_model.to('cuda')
 
-video_path = "videos/zmiana.mp4"
+video_path = "test.mp4"
 
 tracker = sv.ByteTrack(track_activation_threshold=0.1, lost_track_buffer=60)
 generator = sv.get_video_frames_generator(video_path)
@@ -104,6 +104,14 @@ spatial_data = []
 ball_positions = []
 ALPHA = 0.2
 homography_matrix = None
+
+# --- BAZA WIEDZY DO PŁYNNOŚCI ---
+player_history = {}
+player_speeds = {}
+player_positions_smooth = {}  # NOWOŚĆ: Pamięć do wygładzania ruchów na radarze
+FPS = 25
+SPEED_WINDOW = 25
+# --------------------------------
 
 RADAR_SCALE = 6
 radar_bg = create_radar_background(scale=RADAR_SCALE)
@@ -160,8 +168,20 @@ for frame_id, frame in enumerate(generator, start=1):
         field_pos = project_point((feet_x_proc, feet_y_proc), homography_matrix)
 
         if field_pos is None: continue
-        fx, fy = field_pos
-        if not (0 <= fx <= 105 and 0 <= fy <= 68): continue
+        raw_fx, raw_fy = field_pos
+        if not (0 <= raw_fx <= 105 and 0 <= raw_fy <= 68): continue
+
+        # --- WYGŁADZANIE PRZESTRZENNE (Eliminacja skoków radaru) ---
+        if track_id in player_positions_smooth:
+            old_fx, old_fy = player_positions_smooth[track_id]
+            # Używamy tylko 25% nowej pozycji i zachowujemy 75% starej, co pożera "skoki"
+            fx = 0.25 * raw_fx + 0.75 * old_fx
+            fy = 0.25 * raw_fy + 0.75 * old_fy
+        else:
+            fx, fy = raw_fx, raw_fy
+
+        player_positions_smooth[track_id] = (fx, fy)
+        # ------------------------------------------------------------
 
         feet_x_original = int(feet_x_proc / scale_ratio)
         feet_y_original = int(feet_y_proc / scale_ratio)
@@ -178,6 +198,7 @@ for frame_id, frame in enumerate(generator, start=1):
 
         color = last_colors.get(track_id, [255, 255, 255])
         b, g, r = color
+        draw_color = (int(b), int(g), int(r))  # Domyślny kolor przed przypisaniem
 
         team_id = None
         if team_kmeans is None and len(last_colors) >= 10:
@@ -190,26 +211,94 @@ for frame_id, frame in enumerate(generator, start=1):
             team_id = team_kmeans.predict([color])[0]
             if team_id == 0:
                 team_0_positions.append((fx, fy))
+                # Zastępujemy brudny kolor czystym kolorem drużyny 1
+                draw_color = tuple(map(int, team_colors_centers[0]))
             else:
                 team_1_positions.append((fx, fy))
+                # Zastępujemy brudny kolor czystym kolorem drużyny 2
+                draw_color = tuple(map(int, team_colors_centers[1]))
 
+        # --- STABILNE OBLICZANIE PRĘDKOŚCI ---
+        if track_id not in player_history:
+            player_history[track_id] = []
+            player_speeds[track_id] = 0.0
+
+        player_history[track_id].append((fx, fy, frame_id))
+
+        if len(player_history[track_id]) > SPEED_WINDOW:
+            player_history[track_id].pop(0)
+
+        if len(player_history[track_id]) >= 10:
+            past_points = player_history[track_id][:5]
+            avg_past_x = sum(p[0] for p in past_points) / len(past_points)
+            avg_past_y = sum(p[1] for p in past_points) / len(past_points)
+            past_frame = past_points[len(past_points) // 2][2]
+
+            recent_points = player_history[track_id][-5:]
+            avg_curr_x = sum(p[0] for p in recent_points) / len(recent_points)
+            avg_curr_y = sum(p[1] for p in recent_points) / len(recent_points)
+            curr_frame = recent_points[len(recent_points) // 2][2]
+
+            dist_meters = np.hypot(avg_curr_x - avg_past_x, avg_curr_y - avg_past_y)
+            time_seconds = (curr_frame - past_frame) / FPS
+
+            if time_seconds > 0:
+                raw_speed_kmh = (dist_meters / time_seconds) * 3.6
+
+                if raw_speed_kmh > 37.0:
+                    raw_speed_kmh = player_speeds[track_id]
+
+                if raw_speed_kmh < 2.5:
+                    raw_speed_kmh = 0.0
+
+                player_speeds[track_id] = (0.15 * raw_speed_kmh) + (0.85 * player_speeds[track_id])
+
+        speed_kmh = player_speeds.get(track_id, 0.0)
+        # --------------------------------------
+
+        # Wideo AR: Używamy czystego koloru (draw_color)
         cv2.ellipse(proc_frame, center=(feet_x_proc, y2), axes=(int((x2 - x1) / 2), int((y2 - y1) * 0.1)),
-                    angle=0, startAngle=0, endAngle=360, color=(int(b), int(g), int(r)), thickness=2)
-        cv2.putText(proc_frame, f"ID:{track_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (int(b), int(g), int(r)), 2)
+                    angle=0, startAngle=0, endAngle=360, color=draw_color, thickness=2)
+
+        # Wideo AR: Pigułki
+        text_id = f"ID:{track_id}"
+        text_speed = f"{speed_kmh:.1f} km/h"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.45
+
+        (w_id, h_id), _ = cv2.getTextSize(text_id, font, font_scale, 1)
+        (w_sp, h_sp), _ = cv2.getTextSize(text_speed, font, font_scale - 0.05, 1)
+
+        max_width = max(w_id, w_sp)
+        padding_h = 4
+
+        box_x1 = x1
+        box_y2 = y1 - 5
+        box_y1 = box_y2 - (h_id + h_sp + padding_h + 8)
+        box_x2 = x1 + max_width + 12
+
+        cv2.rectangle(proc_frame, (box_x1, box_y1), (box_x2, box_y2), (30, 30, 30), -1)
+        # Boczny pasek też zyskuje czysty kolor
+        cv2.rectangle(proc_frame, (box_x1, box_y1), (box_x1 + 4, box_y2), draw_color, -1)
+
+        cv2.putText(proc_frame, text_id, (box_x1 + 8, box_y1 + h_id + 4), font, font_scale, (255, 255, 255), 1,
+                    cv2.LINE_AA)
+        cv2.putText(proc_frame, text_speed, (box_x1 + 8, box_y2 - 3), font, font_scale - 0.05, (200, 200, 200), 1,
+                    cv2.LINE_AA)
 
         obj_data = {
             "id": int(track_id),
             "type": "person",
             "team": int(team_id) if team_id is not None else -1,
             "point": [feet_x_original, feet_y_original],
-            "color": color,
+            "color": draw_color,  # Zapisujemy wyczyszczony kolor dla Dashboardu
             "field_position": [float(fx), float(fy)]
         }
 
+        # Radar Live: Używamy czystego koloru + eleganckiej, białej obwódki zamiast czarnej
         rx, ry = int(fx * RADAR_SCALE), int(fy * RADAR_SCALE)
-        cv2.circle(current_radar, (rx, ry), 8, (int(b), int(g), int(r)), -1)
-        cv2.circle(current_radar, (rx, ry), 8, (0, 0, 0), 1)
+        cv2.circle(current_radar, (rx, ry), 8, draw_color, -1)
+        cv2.circle(current_radar, (rx, ry), 8, (255, 255, 255), 1)
 
         frame_objects.append(obj_data)
 
@@ -255,7 +344,8 @@ for frame_id, frame in enumerate(generator, start=1):
 
                         if last_touch_team == closest_team and last_touch_player_id != closest_player_id:
                             if last_touch_pos is not None:
-                                dist_passed = np.hypot(current_touch_pos[0] - last_touch_pos[0], current_touch_pos[1] - last_touch_pos[1])
+                                dist_passed = np.hypot(current_touch_pos[0] - last_touch_pos[0],
+                                                       current_touch_pos[1] - last_touch_pos[1])
                                 if dist_passed > MIN_PASS_DISTANCE or loose_ball_frames > 10:
                                     team_passes[closest_team] += 1
 
@@ -281,24 +371,32 @@ for frame_id, frame in enumerate(generator, start=1):
         pct_0 = int((possession_frames[0] / total_possession) * 100) if total_possession > 0 else 0
         pct_1 = 100 - pct_0 if total_possession > 0 else 0
 
-        cv2.rectangle(proc_frame, (10, 10), (450, 180), (0, 0, 0), -1)
-        cv2.putText(proc_frame, "Statystyki Druzynowe", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # --- NOWOCZESNY PANEL STATYSTYK ---
+        overlay = proc_frame.copy()
+
+        cv2.rectangle(overlay, (15, 15), (420, 150), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.8, proc_frame, 0.2, 0, proc_frame)
+
+        cv2.putText(proc_frame, "STATYSTYKI MECZOWE", (30, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.line(proc_frame, (30, 55), (400, 55), (100, 100, 100), 1)
 
         if team_0_positions:
             t0_center_x = sum(p[0] for p in team_0_positions) / len(team_0_positions)
             t0_center_y = sum(p[1] for p in team_0_positions) / len(team_0_positions)
-            rx, ry = int(t0_center_x * RADAR_SCALE), int(t0_center_y * RADAR_SCALE)
 
-            cv2.putText(proc_frame, f"Druzyna 1: {pct_0}% | Podania: {team_passes[0]}", (20, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, c0, 2)
+            cv2.rectangle(proc_frame, (30, 75), (45, 90), c0, -1)
+            cv2.putText(proc_frame, f"Druzyna 1: {pct_0}%   |   Podania: {team_passes[0]}", (60, 88),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (230, 230, 230), 1, cv2.LINE_AA)
 
         if team_1_positions:
             t1_center_x = sum(p[0] for p in team_1_positions) / len(team_1_positions)
             t1_center_y = sum(p[1] for p in team_1_positions) / len(team_1_positions)
-            rx, ry = int(t1_center_x * RADAR_SCALE), int(t1_center_y * RADAR_SCALE)
 
-            cv2.putText(proc_frame, f"Druzyna 2: {pct_1}% | Podania: {team_passes[1]}", (20, 140),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, c1, 2)
+            cv2.rectangle(proc_frame, (30, 115), (45, 130), c1, -1)
+            cv2.putText(proc_frame, f"Druzyna 2: {pct_1}%   |   Podania: {team_passes[1]}", (60, 128),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (230, 230, 230), 1, cv2.LINE_AA)
+        # ----------------------------------
 
     spatial_data.append({
         "frame_id": frame_id,
@@ -345,3 +443,23 @@ if not df_ball.empty and 'ball_x' in df_ball.columns and 'ball_y' in df_ball.col
 
 with open('spatial_data.json', 'w') as f:
     json.dump(spatial_data, f, cls=NumpyEncoder)
+
+with open('match_data.json', 'w') as f:
+    json.dump(match_data, f, cls=NumpyEncoder)
+
+# --- ZAPIS KOŃCOWYCH STATYSTYK DLA DASHBOARDU ---
+total_poss = possession_frames[0] + possession_frames[1]
+final_stats = {
+    "Team_1": {
+        "possession": int((possession_frames[0] / total_poss) * 100) if total_poss > 0 else 0,
+        "passes": team_passes[0]
+    },
+    "Team_2": {
+        "possession": int((possession_frames[1] / total_poss) * 100) if total_poss > 0 else 0,
+        "passes": team_passes[1]
+    }
+}
+
+with open('match_stats.json', 'w') as f:
+    json.dump(final_stats, f)
+# ---------------------------------------------
